@@ -8,16 +8,24 @@ import logging
 import os
 import platform
 import secretstorage
+import subprocess
 import sys
+
+from contextlib import redirect_stdout
 
 from pprint import pprint
 
+if platform.system() != 'Windows':
+    gpgPgmPath = 'gpg'
+else:
+    gpgPgmPath = os.path.abspath('/Program Files (x86)/GNU/GnuPG/gpg2.exe')
 
 def main():
     
-    setPassword = False
-    
-    dftPassword = '[redacted]'
+    dftPassword = '[passphrase_needed]'
+    ownerTrustFileName = 'OutputFiles/GpgKeysOwnerTrust.txt'
+    gpgKeysOutFileName = 'OutputFiles/GpgKeyringEntries.ini'
+    allKeysOutFileName = 'OutputFiles/AllKeyringEntries.ini'
     
     # obtain any command-line arguments
     # overriding any values set so far
@@ -26,14 +34,10 @@ def main():
         if nextArg != "":
             if nextArg == "dftPassword":
                 dftPassword = argv
-            if nextArg == "setPassword":
-                setPassword = (argv.lower() == 'true')
             nextArg = ""
         else:
             if argv.lower() == "--dftpassword" or argv.lower() == "-dftpassword":
                 nextArg = "dftPassword"
-            if argv.lower() == "--setpassword" or argv.lower() == "-setpassword":
-                nextArg = "setPassword"
 
     # instantiate and initialize
     # logging objects and handlers
@@ -48,15 +52,25 @@ def main():
     public_keys, secret_keys, gpg_keyring_ids = getGpgKeys(isTestMode=False,
                                                            pgmLogger=logging)
 
-    tgtFile = 'OutputFiles/GpgKeyRingEntries.ini'
-    tgtFileExpanded = getPathExpanded(tgtFile, None, pgmLogger=logging)
-    errStr = createFolderIfNotExist(tgtFileExpanded, containsFileName=True, pgmLogger=logging)
+    gpgKeysOutFileNameExpanded = getPathExpanded(gpgKeysOutFileName, None, pgmLogger=logging)
+    errStr = createFolderIfNotExist(gpgKeysOutFileNameExpanded, containsFileName=True, pgmLogger=logging)
         
-    with io.open(tgtFile, 'w', encoding='cp1252') as outFile:
+    with io.open(gpgKeysOutFileNameExpanded, 'w', encoding='cp1252') as outFile:
+        print('[DEFAULT]')
+        print('')
+        print('    postToKeyring=True')
+        print('    redactPasswords=True')
+        print('    deletePasswords=False')
+        print('')
         print ('[gpgKeys]')
         print ('')
-        outFile.write('[gpgKeys]')
+        outFile.write('[DEFAULT]%s' % os.linesep)
         outFile.write(os.linesep)
+        outFile.write('    postToKeyring=True%s' % os.linesep)
+        outFile.write('    redactPasswords=True%s' % os.linesep)
+        outFile.write('    deletePasswords=False%s' % os.linesep)
+        outFile.write(os.linesep)
+        outFile.write('[gpgKeys]%s' % os.linesep)
         outFile.write(os.linesep)
         for gpg_keyring_id in gpg_keyring_ids.items():
             
@@ -85,14 +99,13 @@ def main():
                 outFile.write(strValue)
                 outFile.write(os.linesep)
                 
-                if setPassword:
-                    # load the keyId and userName
-                    # into the user's keyring along
-                    # with the corresponding password
-                    setPwdViaKeyring(keyIdLast8,
-                                     userName,
-                                     currPwd if not None else dftPassword,
-                                     pgmLogger=logging)
+                # load the keyId and userName
+                # into the user's keyring along
+                # with the corresponding password
+                setPwdViaKeyring(keyIdLast8,
+                                 userName,
+                                 currPwd if not None else dftPassword,
+                                 pgmLogger=logging)
             
 
                
@@ -100,19 +113,20 @@ def main():
                                                             redactPasswords=False,
                                                             isTestMode=False,
                                                             pgmLogger=logging)
+
+    # export the GPG keys ownertrust to a file
+    ownerTrustFileNameExpanded, errStr = exportUserTrustFile(ownerTrustFileName, isTestMode=True, pgmLogger=logging)
     
     print ('')
 
     print ('All Keyring Entries Presently in the User\'s Keyring')
     print ('')
     
-    tgtFile = 'OutputFiles/AllKeyRingEntries.txt'
-    tgtFileExpanded = getPathExpanded(tgtFile, None, pgmLogger=logging)
-    errStr = createFolderIfNotExist(tgtFileExpanded, containsFileName=True, pgmLogger=logging)
+    allKeysOutFileNameExpanded = getPathExpanded(allKeysOutFileName, None, pgmLogger=logging)
+    errStr = createFolderIfNotExist(allKeysOutFileName, containsFileName=True, pgmLogger=logging)
     
-    with io.open(tgtFile, 'w', encoding='cp1252') as outFile:
-        outFile.write('Keyring Entries Presently in the User\'s Keyring')
-        outFile.write(os.linesep)
+    with io.open(allKeysOutFileName, 'w', encoding='cp1252') as outFile:
+        outFile.write('[allKeyringEntries]%s' % os.linesep)
         outFile.write(os.linesep)
         for item in orderedEntries.items():
             strValue = '    ' + '='.join(item)
@@ -162,7 +176,7 @@ def getPwdViaKeyring(key,
         pgmLogger.error(errStr)
         
     return password, errStr
-    
+
     
 #===============================
 # Set password in user's keyring
@@ -181,6 +195,27 @@ def setPwdViaKeyring(key,
     except Exception as e:
         errStr = str(e)
         pgmLogger.error("FAILURE: Setting of password for key: %s and user: %s" % (key, userName))
+        pgmLogger.error(errStr)
+        
+    return errStr
+    
+    
+#==================================
+# Delete password in user's keyring
+#==================================
+    
+def dltPwdViaKeyring(key,
+                     userName,
+                     pgmLogger=None):
+    
+    errStr = None
+    
+    # delete the entry for the specified service and user
+    try:
+        keyring.delete_password(key, userName)
+    except Exception as e:
+        errStr = str(e)
+        pgmLogger.error("FAILURE: Password for key: %s and user: %s was NOT deleted!" % (key, userName))
         pgmLogger.error(errStr)
         
     return errStr
@@ -273,6 +308,44 @@ def getGpgKeys(isTestMode=False,
             print('key: %s, value: %s' %(gpgKey['uids'][0], gpgKey['keyid']))
     
     return public_keys, secret_keys, gpg_keyring_ids
+    
+
+# =====================================================================
+# List both the public and private keys
+# =====================================================================
+
+def exportUserTrustFile(ownerTrustFileName,
+                        isTestMode=False,
+                        pgmLogger=None):
+    
+    errStr = None
+    
+    ownerTrustFileNameExpanded = getPathExpanded(ownerTrustFileName,
+                                                 pgmLogger=pgmLogger)
+    
+    errStr = createFolderIfNotExist(ownerTrustFileNameExpanded,
+                                    containsFileName=True,
+                                    pgmLogger=pgmLogger)
+    
+    if not errStr:
+    
+        # ============================
+        # Initialize the GPG object
+        # that will be used to perform
+        # the cryptographic operation
+        # ============================
+        
+        gpg = None
+        if platform.system() != 'Windows':
+            gpg = gnupg.GPG()
+        else:
+            gpg = gnupg.GPG()
+            
+        with open(ownerTrustFileNameExpanded, 'w') as outFile:
+            with redirect_stdout(outFile):
+                subprocess.call([gpgPgmPath, '--export-ownertrust'], stdout=outFile, shell=False)
+    
+    return ownerTrustFileNameExpanded, errStr
 
 
 # =============================================================================    
