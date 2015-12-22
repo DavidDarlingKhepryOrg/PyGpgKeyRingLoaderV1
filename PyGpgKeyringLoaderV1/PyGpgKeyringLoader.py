@@ -1,19 +1,29 @@
 #!/usr/bin/python
 
 import collections
+import datetime
 import gnupg
 import io
 import keyring
 import logging
 import os
 import platform
-import secretstorage
 import subprocess
 import sys
+import time
+
+if platform.system() != 'Windows':
+    import secretstorage # @UnusedImport
+else:
+    from keyring.backends.Windows import win32cred # @UnusedImport
+
+from collections import OrderedDict
 
 from contextlib import redirect_stdout
 
 from pprint import pprint
+
+isTestMode = False
 
 if platform.system() != 'Windows':
     gpgPgmPath = 'gpg'
@@ -23,9 +33,12 @@ else:
 def main():
     
     dftPassword = '[passphrase_needed]'
+    allOwnerTrust = 6
+    dftOwnerTrust = 5
     ownerTrustFileName = 'OutputFiles/GpgKeysOwnerTrust.txt'
     gpgKeysOutFileName = 'OutputFiles/GpgKeyringEntries.ini'
     allKeysOutFileName = 'OutputFiles/AllKeyringEntries.ini'
+    gpgKeysFolderName = 'gpgKeys'
     
     # obtain any command-line arguments
     # overriding any values set so far
@@ -49,11 +62,46 @@ def main():
                         format=dftMsgFormat,
                         datefmt=dftDateFormat)
     
-    public_keys, secret_keys, gpg_keyring_ids = getGpgKeys(isTestMode=False,
+    # add all of the GPG keys in the "gpgKeys" folder to the GPG keyring
+    gpgKeysFolderNameExpanded = getPathExpanded(gpgKeysFolderName, pgmLogger=logging)
+    for root, dirs, files in os.walk(gpgKeysFolderNameExpanded):
+        for file in files:
+            fullPath = os.path.join(root, file)
+            if os.path.exists(fullPath):
+                addGpgKey(fullPath, isTestMode=isTestMode, pgmLogger=logging)
+    
+    # now get all of the public and secret keys presently in the GPG keyring
+    public_keys, secret_keys, gpg_keyring_ids = getGpgKeys(isTestMode=isTestMode,
                                                            pgmLogger=logging)
+        
+    # derive the owner trust based upon
+    # whether or not a secret key is present
+    
+    ownerTrustFileNameExpanded = getPathExpanded(ownerTrustFileName,
+                                                 pgmLogger=logging)
+    errStr = createFolderIfNotExist(ownerTrustFileNameExpanded,
+                                    containsFileName=True,
+                                    pgmLogger=logging)
+
+    if errStr == None:
+        print ('')
+        print ('Export OwnerTrust File Name: "%s"' % ownerTrustFileName)
+        print ('')
+        ownerTrustFileNameExpanded, errStr = exportOwnerTrustFileViaGpgKeys(ownerTrustFileName, public_keys, secret_keys, dftOwnerTrust, allOwnerTrust, isTestMode=isTestMode, pgmLogger=logging)
+
+    if errStr == None:
+        print ('')
+        print ('Import OwnerTrust File Name: "%s"' % ownerTrustFileName)
+        print ('')
+        errStr = importOwnerTrustFile(ownerTrustFileName, isTestMode=isTestMode, pgmLogger=logging)
+        
 
     gpgKeysOutFileNameExpanded = getPathExpanded(gpgKeysOutFileName, None, pgmLogger=logging)
     errStr = createFolderIfNotExist(gpgKeysOutFileNameExpanded, containsFileName=True, pgmLogger=logging)
+
+    print ('')
+    print ('GPG Keyring Entries File Name: "%s"' % gpgKeysOutFileNameExpanded)
+    print ('')
         
     with io.open(gpgKeysOutFileNameExpanded, 'w', encoding='cp1252') as outFile:
         print('[DEFAULT]')
@@ -84,13 +132,15 @@ def main():
                                            redactPasswords=False,
                                            logResults=False,
                                            pgmLogger=logging,
-                                           isTestMode=True,
+                                           isTestMode=isTestMode,
                                            defaultPassword=dftPassword)
             
             # if no errors
             # so far......
             if errStr == None:
                 
+                # get last 8 chars
+                # of the GPG key's ID
                 keyIdLast8 = keyId[-8:]
                 
                 # output the current user's keyId, userName, and password
@@ -109,21 +159,16 @@ def main():
             
 
                
-    dictEntries, nominalDict, orderedEntries, errStr = getKeyringEntries(
-                                                            redactPasswords=False,
-                                                            isTestMode=False,
-                                                            pgmLogger=logging)
+    dictEntries, nominalDict, orderedEntries, errStr = getKeyringEntries(redactPasswords=False,
+                                                                         isTestMode=isTestMode,
+                                                                         pgmLogger=logging)
 
-    # export the GPG keys ownertrust to a file
-    ownerTrustFileNameExpanded, errStr = exportUserTrustFile(ownerTrustFileName, isTestMode=True, pgmLogger=logging)
-    
-    print ('')
-
-    print ('All Keyring Entries Presently in the User\'s Keyring')
-    print ('')
-    
     allKeysOutFileNameExpanded = getPathExpanded(allKeysOutFileName, None, pgmLogger=logging)
     errStr = createFolderIfNotExist(allKeysOutFileName, containsFileName=True, pgmLogger=logging)
+
+    print ('')
+    print ('All Keyring Entries Presently in the User\'s Keyring File Name: "%s"' % allKeysOutFileNameExpanded)
+    print ('')
     
     with io.open(allKeysOutFileName, 'w', encoding='cp1252') as outFile:
         outFile.write('[allKeyringEntries]%s' % os.linesep)
@@ -238,22 +283,48 @@ def getKeyringEntries(redactPasswords=True,
     
     # get the password for the specified user and service
     try:
-        bus = secretstorage.dbus_init()
-        collection = secretstorage.get_default_collection(bus)
-        for item in collection.get_all_items():
-            entries[item.get_label()] = item.get_attributes()
-            service = item.get_attributes()['service']
-            username = item.get_attributes()['username']
-            password, errStr = getPwdViaKeyring(
-                                    service,
-                                    username,
-                                    redactPasswords=redactPasswords,
-                                    logResults=logResults,
-                                    pgmLogger=pgmLogger,
-                                    isTestMode=isTestMode)
-            if redactPasswords:
-                password = '[redacted]'
-            nominalDict['%s,%s' % (service, username)] = password
+        # use secretstorage library
+        # for non-Windows operating system
+        # (may not be useful for MacOS)
+        if platform.system() != 'Windows':
+            bus = secretstorage.dbus_init()
+            collection = secretstorage.get_default_collection(bus)
+            for item in collection.get_all_items():
+                entries[item.get_label()] = item.get_attributes()
+                application = item.get_attributes()['application']
+                if application == 'python-keyring':
+                    service = item.get_attributes()['service']
+                    userName = item.get_attributes()['username']
+                    password, errStr = getPwdViaKeyring(
+                                            service,
+                                            userName,
+                                            redactPasswords=redactPasswords,
+                                            logResults=logResults,
+                                            pgmLogger=pgmLogger,
+                                            isTestMode=isTestMode)
+                    if redactPasswords:
+                        password = '[redacted]'
+                    nominalDict['%s,%s' % (service, userName)] = password
+        # otherwise
+        else:
+            # use WinVault for Windows operating system
+            for credential in win32cred.CredEnumerate():
+                # pprint (credential)
+                application = credential['Comment']
+                if application == 'Stored using python-keyring':
+                    # password = str(credential['CredentialBlob']).replace('\\x00','')[2:-1] 
+                    service = credential['TargetName']
+                    userName = credential['UserName']
+                    password, errStr = getPwdViaKeyring(
+                                            service,
+                                            userName,
+                                            redactPasswords=redactPasswords,
+                                            logResults=logResults,
+                                            pgmLogger=pgmLogger,
+                                            isTestMode=isTestMode)
+                    if redactPasswords:
+                        password = '[redacted]'
+                    nominalDict['%s,%s' % (service, userName)] = password
         if len(nominalDict) > 0:
             orderedDict = collections.OrderedDict(sorted(nominalDict.items()))
         if isTestMode:
@@ -268,14 +339,52 @@ def getKeyringEntries(redactPasswords=True,
     
 
 # =====================================================================
-# List both the public and private keys
+# Add a GPG key to the GPG keyring via an export file
+# =====================================================================
+
+def addGpgKey(gpgKeyFileName,
+              isTestMode=False,
+              pgmLogger=None):
+    
+    errStr = None
+    
+    # ============================
+    # Initialize the GPG object
+    # that will be used to perform
+    # the cryptographic operation
+    # ============================
+
+    try:
+            
+        gpg = None
+        
+        if platform.system() != 'Windows':
+            gpg = gnupg.GPG()
+        else:
+            gpg = gnupg.GPG()
+
+        gpgKeyFileNameExpanded = getPathExpanded(gpgKeyFileName, pgmLogger=pgmLogger)
+        
+        if os.path.exists(gpgKeyFileNameExpanded):
+            subprocess.call([gpgPgmPath, '--import', '%s' % gpgKeyFileNameExpanded], shell=False)
+        else:
+            errStr = 'GPG key file for import does NOT exist: %s' % gpgKeyFileNameExpanded
+            pgmLogger.error(errStr)
+        
+    except Exception as e:
+        errStr = str(e)
+        pgmLogger.error(errStr)
+    
+    return errStr
+    
+
+# =====================================================================
+# Get both the public and private GPG keys
 # =====================================================================
 
 def getGpgKeys(isTestMode=False,
                 pgmLogger=None):
     
-    public_keys = {}
-    secret_keys = {}
     gpg_keyring_ids = {}
 
     # ============================
@@ -311,14 +420,13 @@ def getGpgKeys(isTestMode=False,
     
 
 # =====================================================================
-# List both the public and private keys
+# Export the owner trust file via StdOut
 # =====================================================================
 
-def exportUserTrustFile(ownerTrustFileName,
-                        isTestMode=False,
-                        pgmLogger=None):
-    
-    errStr = None
+def exportOwnerTrustFileViaStdOut(ownerTrustFileName,
+                                  stdOutToFile=False,
+                                  isTestMode=False,
+                                  pgmLogger=None):
     
     ownerTrustFileNameExpanded = getPathExpanded(ownerTrustFileName,
                                                  pgmLogger=pgmLogger)
@@ -335,17 +443,117 @@ def exportUserTrustFile(ownerTrustFileName,
         # the cryptographic operation
         # ============================
         
-        gpg = None
-        if platform.system() != 'Windows':
-            gpg = gnupg.GPG()
-        else:
-            gpg = gnupg.GPG()
-            
-        with open(ownerTrustFileNameExpanded, 'w') as outFile:
-            with redirect_stdout(outFile):
-                subprocess.call([gpgPgmPath, '--export-ownertrust'], stdout=outFile, shell=False)
+        try:
+            if stdOutToFile:
+                with open(ownerTrustFileNameExpanded, 'w') as outFile:
+                    with redirect_stdout(outFile):
+                        subprocess.call([gpgPgmPath, '--export-ownertrust'], stdout=outFile, shell=False)
+            else:
+                subprocess.call([gpgPgmPath, '--export-ownertrust'], shell=False)
+        except Exception as e:
+            errStr = str(e)
+            pgmLogger.error(errStr)
     
     return ownerTrustFileNameExpanded, errStr
+    
+
+# =====================================================================
+# Export the owner trust file via StdOut
+# =====================================================================
+
+def exportOwnerTrustFileViaGpgKeys(ownerTrustFileName,
+                                   public_keys,
+                                   secret_keys,
+                                   dftOwnerTrust,
+                                   allOwnerTrust,
+                                   isTestMode=False,
+                                   pgmLogger=None):
+    
+    ownerTrustFileNameExpanded = getPathExpanded(ownerTrustFileName,
+                                                 pgmLogger=pgmLogger)
+    
+    errStr = createFolderIfNotExist(ownerTrustFileNameExpanded,
+                                    containsFileName=True,
+                                    pgmLogger=pgmLogger)
+    
+    if errStr == None:
+
+        dateFmt = '%a %d %b %Y %I:%M:%S %p'
+        dateStr = datetime.datetime.strftime(datetime.datetime.now(), dateFmt) + ' ' + time.strftime('%Z')
+        print ('# List of assigned trustvalues, created %s' % dateStr)
+        print ('# (Use \'gpg --import-ownertrust "%s"\' to restore them)' % ownerTrustFileNameExpanded)
+        
+        # '-':0 no owner trust assigned
+        # 'e':? trust calculation has failed
+        # 'q':2 not enough information calculation of trust
+        # 'n':3 never trust this key
+        # 'm':4 is marginally trusted
+        # 'f':5 is fully trusted
+        # 'u':6 is ultimately trusted
+        ownerTrustDict = {'u': 6, 'f':5, 'm':4, 'n':3, 'q':2, '-':0}
+        
+        tempDict = {}
+        for public_key in public_keys:
+            tempDict[public_key['fingerprint']] = public_key.copy()
+            
+        publicKeys = OrderedDict()
+        for tempKey in sorted(tempDict):
+            publicKeys[tempKey] = tempDict[tempKey]
+            
+        secretKeys = {}
+        for secret_key in secret_keys:
+            secretKeys[secret_key['fingerprint']] = secret_key.copy()
+        
+        if not errStr:
+            with open(ownerTrustFileNameExpanded, 'w') as outFile:
+                outFile.write('# List of assigned trustvalues, created %s%s' % (dateStr, os.linesep))
+                outFile.write('# (Use \'gpg --import-ownertrust "%s"\' to restore them)%s' % (ownerTrustFileNameExpanded, os.linesep))
+                for key, value in publicKeys.items():
+                    if value['ownertrust'] == '-':
+                        if key in secretKeys.keys():
+                            ownerTrust = allOwnerTrust
+                        else:
+                            ownerTrust = dftOwnerTrust
+                    else:
+                        ownerTrust = ownerTrustDict[value['ownertrust']]
+                    print('%s:%s:' % (value['fingerprint'], ownerTrust))
+                    outFile.write('%s:%s:' % (value['fingerprint'], ownerTrust))
+                    outFile.write(os.linesep)
+    
+    return ownerTrustFileNameExpanded, errStr
+    
+
+# =====================================================================
+# Import the owner trust file via an owner trust file
+# =====================================================================
+
+def importOwnerTrustFile(ownerTrustFileName,
+                         isTestMode=False,
+                         pgmLogger=None):
+    
+    ownerTrustFileNameExpanded = getPathExpanded(ownerTrustFileName,
+                                                 pgmLogger=pgmLogger)
+    
+    errStr = createFolderIfNotExist(ownerTrustFileNameExpanded,
+                                    containsFileName=True,
+                                    pgmLogger=pgmLogger)
+    
+    if not errStr:
+    
+        # ============================
+        # Initialize the GPG object
+        # that will be used to perform
+        # the cryptographic operation
+        # ============================
+        
+        try:
+            subprocess.call([gpgPgmPath, '--import-ownertrust', '%s' % ownerTrustFileNameExpanded], shell=False)
+        except Exception as e:
+            errStr = str(e)
+            pgmLogger.error(errStr)
+    
+    return errStr
+
 
 
 # =============================================================================    
