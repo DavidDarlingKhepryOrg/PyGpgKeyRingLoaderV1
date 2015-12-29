@@ -32,7 +32,8 @@ else:
 
 def main():
     
-    dftPassword = '[passphrase_needed]'
+#    dftPassword = '[passphrase_needed]'
+    dftPassword = '[redacted]'
     allOwnerTrust = 6
     dftOwnerTrust = 5
     ownerTrustFileName = 'OutputFiles/GpgKeysOwnerTrust.txt'
@@ -73,7 +74,17 @@ def main():
     # now get all of the public and secret keys presently in the GPG keyring
     public_keys, secret_keys, gpg_keyring_ids = getGpgKeys(isTestMode=isTestMode,
                                                            pgmLogger=logging)
+
+    gpg_keyring_ids_by_keyIds = {}
+    gpg_keyring_ids_by_userNames = {}
+    
+    for gpg_keyring_id in gpg_keyring_ids.items():
         
+        keyId = '%s' % gpg_keyring_id[0]
+        userName = '%s' % gpg_keyring_id[1]
+        gpg_keyring_ids_by_keyIds[keyId] = userName
+        gpg_keyring_ids_by_userNames[userName] = keyId
+    
     # derive the owner trust based upon
     # whether or not a secret key is present
     
@@ -120,10 +131,7 @@ def main():
         outFile.write(os.linesep)
         outFile.write('[gpgKeys]%s' % os.linesep)
         outFile.write(os.linesep)
-        for gpg_keyring_id in gpg_keyring_ids.items():
-            
-            keyId = '%s' % gpg_keyring_id[0]
-            userName = '%s' % gpg_keyring_id[1]
+        for userName, keyId in collections.OrderedDict(sorted(gpg_keyring_ids_by_userNames.items())).items():
             
             # fetch the user's current password
             # via then keyId and userName
@@ -159,22 +167,65 @@ def main():
             
 
                
-    dictEntries, nominalDict, orderedEntries, errStr = getKeyringEntries(redactPasswords=False,
-                                                                         isTestMode=isTestMode,
-                                                                         pgmLogger=logging)
+    keyringEntries, pwdSvcUsrTriplets, svcUsrPwdTriplets, usrSvcPwdTriplets, errStr = getKeyringEntries(redactPasswords=False,
+                                                                                                        isTestMode=isTestMode,
+                                                                                                        pgmLogger=logging)
 
     allKeysOutFileNameExpanded = getPathExpanded(allKeysOutFileName, None, pgmLogger=logging)
     errStr = createFolderIfNotExist(allKeysOutFileName, containsFileName=True, pgmLogger=logging)
 
     print ('')
-    print ('All Keyring Entries Presently in the User\'s Keyring File Name: "%s"' % allKeysOutFileNameExpanded)
+    print ('User\'s Keyring Entries Keyring File Name: "%s"' % allKeysOutFileNameExpanded)
     print ('')
     
     with io.open(allKeysOutFileName, 'w', encoding='cp1252') as outFile:
-        outFile.write('[allKeyringEntries]%s' % os.linesep)
+        
+        print('[DEFAULT]')
+        print('')
+        print('    postToKeyring=True')
+        print('    redactPasswords=True')
+        print('    deletePasswords=False')
+        print('')
+
+        outFile.write('[DEFAULT]%s' % os.linesep)
         outFile.write(os.linesep)
-        for item in orderedEntries.items():
-            strValue = '    ' + '='.join(item)
+        outFile.write('    postToKeyring=True%s' % os.linesep)
+        outFile.write('    redactPasswords=True%s' % os.linesep)
+        outFile.write('    deletePasswords=False%s' % os.linesep)
+        outFile.write(os.linesep)
+        
+        print ('[keyringEntriesByUsrSvcPwd]')
+        print (os.linesep)
+        outFile.write('[keyringEntriesByUsrSvcPwd]%s' % os.linesep)
+        outFile.write(os.linesep)
+        for usr, svc, pwd in sorted(usrSvcPwdTriplets):
+            strValue = '    %s,%s=%s' % (svc, usr, pwd)
+            print(strValue)
+            outFile.write(strValue)
+            outFile.write(os.linesep)
+
+        print (os.linesep)
+        outFile.write(os.linesep)
+        
+        print ('[keyringEntriesBySvcUsrPwd]')
+        print (os.linesep)
+        outFile.write('[keyringEntriesBySvcUsrPwd]%s' % os.linesep)
+        outFile.write(os.linesep)
+        for svc, usr, pwd in sorted(svcUsrPwdTriplets):
+            strValue = '    %s,%s=%s' % (svc, usr, pwd)
+            print(strValue)
+            outFile.write(strValue)
+            outFile.write(os.linesep)
+
+        print (os.linesep)
+        outFile.write(os.linesep)
+        
+        print ('[keyringEntriesByPwdSvcUsr]')
+        print (os.linesep)
+        outFile.write('[keyringEntriesByPwdSvcUsr]%s' % os.linesep)
+        outFile.write(os.linesep)
+        for pwd, svc, usr in sorted(pwdSvcUsrTriplets):
+            strValue = '    %s,%s=%s' % (svc, usr, pwd)
             print(strValue)
             outFile.write(strValue)
             outFile.write(os.linesep)
@@ -280,6 +331,9 @@ def getKeyringEntries(redactPasswords=True,
     entries = {}
     nominalDict = {}
     orderedDict = collections.OrderedDict()
+    pwdSvcUsrTriplets = []
+    svcUsrPwdTriplets = []
+    usrSvcPwdTriplets = []
     
     # get the password for the specified user and service
     try:
@@ -304,11 +358,14 @@ def getKeyringEntries(redactPasswords=True,
                                             isTestMode=isTestMode)
                     if redactPasswords:
                         password = '[redacted]'
-                    nominalDict['%s,%s' % (service, userName)] = password
+                    # push triplets to lists
+                    pwdSvcUsrTriplets.append((password, service, userName))
+                    svcUsrPwdTriplets.append((service, userName, password))
+                    usrSvcPwdTriplets.append((userName, service, password))
         # otherwise
         else:
             # use WinVault for Windows operating system
-            for credential in win32cred.CredEnumerate():
+            for credential in win32cred.CredEnumerate(): # @UndefinedVariable
                 # pprint (credential)
                 application = credential['Comment']
                 if application == 'Stored using python-keyring':
@@ -324,9 +381,10 @@ def getKeyringEntries(redactPasswords=True,
                                             isTestMode=isTestMode)
                     if redactPasswords:
                         password = '[redacted]'
-                    nominalDict['%s,%s' % (service, userName)] = password
-        if len(nominalDict) > 0:
-            orderedDict = collections.OrderedDict(sorted(nominalDict.items()))
+                    # push triplets to lists
+                    pwdSvcUsrTriplets.append((password, service, userName))
+                    svcUsrPwdTriplets.append((service, userName, password))
+                    usrSvcPwdTriplets.append((userName, service, password))
         if isTestMode:
             for k,v in orderedDict.items():
                 print('%s=%s' % (k, v))
@@ -335,7 +393,7 @@ def getKeyringEntries(redactPasswords=True,
         pgmLogger.error("FAILURE: Could not obtain list of keyring entries")
         pgmLogger.error(errStr)
         
-    return entries, nominalDict, orderedDict, errStr
+    return entries, pwdSvcUsrTriplets, svcUsrPwdTriplets, usrSvcPwdTriplets, errStr
     
 
 # =====================================================================
